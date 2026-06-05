@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// NEXUS HUB XD — generate.js (Browser-side, No Server Needed)
+// NEXUS HUB XD — generate.js
 // ═══════════════════════════════════════════════════════════════
 
 const GROQ_KEYS = [
@@ -8,119 +8,124 @@ const GROQ_KEYS = [
   'YOUR_GROQ_API_KEY_3',
 ];
 
-// ── RATE LIMIT TRACKER ─────────────────────────────────────────
-// Track which keys are rate-limited and when they reset
-const keyRateLimited = {}; // { keyIndex: resetTimestamp }
+// ── SMART KEY MANAGER ─────────────────────────────────────────
+// Tracks rate limits per key in memory (resets on page reload)
+const keyStatus = {}; // { idx: { limited: bool, resetAt: timestamp } }
 
 function isKeyAvailable(idx) {
-  if (!keyRateLimited[idx]) return true;
-  if (Date.now() > keyRateLimited[idx]) {
-    delete keyRateLimited[idx]; // Reset expired
-    return true;
-  }
+  const s = keyStatus[idx];
+  if (!s || !s.limited) return true;
+  if (Date.now() > s.resetAt) { keyStatus[idx] = { limited: false }; return true; }
   return false;
 }
 
-function markKeyRateLimited(idx, retryAfterSec) {
-  const waitMs = (retryAfterSec || 60) * 1000;
-  keyRateLimited[idx] = Date.now() + waitMs;
+function markRateLimited(idx, retryAfterSec) {
+  const wait = Math.max((retryAfterSec || 60), 30) * 1000;
+  keyStatus[idx] = { limited: true, resetAt: Date.now() + wait };
   console.warn(`Key ${idx+1} rate limited for ${retryAfterSec || 60}s`);
 }
 
-function getAvailableKeyCount() {
-  return GROQ_KEYS.filter((k, i) => k && !k.startsWith('YOUR_') && isKeyAvailable(i)).length;
+// Returns how many seconds until a key is free (0 if free now)
+function getWaitTime() {
+  const times = GROQ_KEYS.map((k, i) => {
+    if (!k || k.startsWith('YOUR_')) return Infinity;
+    if (isKeyAvailable(i)) return 0;
+    return Math.ceil((keyStatus[i].resetAt - Date.now()) / 1000);
+  });
+  return Math.min(...times);
 }
 
-// ── API ROTATION ──────────────────────────────────────────────
-let lastKeyIndex = 0;
-async function callGroq(body) {
-  const validKeys = GROQ_KEYS.filter(k => k && !k.startsWith('YOUR_'));
-  if (validKeys.length === 0) {
-    console.error('No valid GROQ API keys set!');
-    return { error: 'no_keys' };
-  }
+// ── API CALL WITH SMART ROTATION ──────────────────────────────
+let lastKeyIdx = 0;
 
-  for (let attempt = 0; attempt < GROQ_KEYS.length; attempt++) {
-    const idx = (lastKeyIndex + attempt) % GROQ_KEYS.length;
-    const key = GROQ_KEYS[idx];
-    if (!key || key.startsWith('YOUR_')) continue;
-    if (!isKeyAvailable(idx)) {
-      console.warn(`Key ${idx+1} still rate limited, skipping...`);
-      continue;
-    }
+async function callGroq(body) {
+  const validIdxs = GROQ_KEYS.map((k, i) => i).filter(i => {
+    const k = GROQ_KEYS[i];
+    return k && !k.startsWith('YOUR_');
+  });
+
+  if (validIdxs.length === 0) return { error: 'no_keys' };
+
+  // Try each valid key, starting from last used
+  for (let attempt = 0; attempt < validIdxs.length; attempt++) {
+    const idx = validIdxs[(lastKeyIdx + attempt) % validIdxs.length];
+    if (!isKeyAvailable(idx)) continue;
 
     try {
       const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${GROQ_KEYS[idx]}`
+        },
         body: JSON.stringify(body)
       });
 
       if (res.status === 429) {
-        // Parse retry-after header if available
-        const retryAfter = parseInt(res.headers.get('retry-after') || res.headers.get('x-ratelimit-reset-requests') || '60');
-        markKeyRateLimited(idx, retryAfter);
+        let retryAfter = 60;
+        try {
+          const errJson = await res.clone().json();
+          // GROQ returns retry time in error message
+          const match = (errJson?.error?.message || '').match(/try again in (\d+\.?\d*)s/i);
+          if (match) retryAfter = Math.ceil(parseFloat(match[1]));
+          const hdr = res.headers.get('retry-after');
+          if (hdr) retryAfter = parseInt(hdr);
+        } catch {}
+        markRateLimited(idx, retryAfter);
         continue;
       }
+
       if (res.status === 401) {
-        console.error(`Key ${idx+1} invalid/expired (401)`);
+        console.error(`Key ${idx+1} unauthorized (401) — check if key is valid`);
+        keyStatus[idx] = { limited: true, resetAt: Date.now() + 999999999 }; // Mark as dead
         continue;
       }
+
       if (!res.ok) {
-        const e = await res.text();
-        console.error(`Key ${idx+1} error ${res.status}: ${e}`);
+        const txt = await res.text();
+        console.error(`Key ${idx+1} error ${res.status}:`, txt);
         continue;
       }
-      lastKeyIndex = idx;
+
+      lastKeyIdx = (validIdxs.indexOf(idx) + 1) % validIdxs.length; // Rotate for next call
       return { res };
+
     } catch (err) {
-      console.error(`Key ${idx+1} fetch error:`, err.message);
+      console.error(`Key ${idx+1} network error:`, err.message);
     }
   }
 
-  // All keys failed — check if all are rate limited
-  const allRateLimited = GROQ_KEYS.every((k, i) => {
-    if (!k || k.startsWith('YOUR_')) return true;
-    return !isKeyAvailable(i);
-  });
-
-  if (allRateLimited) {
-    // Find soonest reset time
-    const resetTimes = Object.values(keyRateLimited).filter(Boolean);
-    const soonestReset = resetTimes.length ? Math.min(...resetTimes) : Date.now() + 60000;
-    const waitSec = Math.ceil((soonestReset - Date.now()) / 1000);
-    return { error: 'rate_limit', waitSec };
-  }
-
+  // All keys failed — check wait time
+  const wait = getWaitTime();
+  if (wait === Infinity) return { error: 'no_keys' };
+  if (wait > 0) return { error: 'rate_limit', waitSec: wait };
   return { error: 'all_failed' };
 }
 
-// ── EXAM LEVEL SYSTEM PROMPTS ─────────────────────────────────
+// ── EXAM PROMPTS ──────────────────────────────────────────────
 const EXAM_PROMPTS = {
   'NEET UG': `You are an expert NEET UG MCQ generator for Biology, Physics, Chemistry.
 NEET UG standards: Strictly NCERT-based (Class 11 & 12). Cover conceptual understanding, application, and NCERT line-based questions.
 Difficulty: medical entrance level. Focus on NCERT definitions, diagrams, examples, clinical applications, and PYQ-style questions.
-Question variety is MANDATORY: use different starting words for each question. Mix: direct concept, NCERT statement completion, which-is-correct, which-is-incorrect, assertion-reason style, example-based, organism/structure identification.`,
+Question variety is MANDATORY: Mix direct concept, NCERT statement completion, which-is-correct, which-is-incorrect, assertion-reason style.`,
 
   'JEE Main': `You are an expert JEE Main MCQ generator for Physics, Chemistry, Mathematics.
 JEE Main standards: NTA pattern, application-based, numerical problems, conceptual clarity.
-Difficulty: engineering entrance level. Include formula-based, concept-based questions.`,
+Difficulty: engineering entrance level.`,
 
   'JEE Advanced': `You are an expert JEE Advanced MCQ generator for Physics, Chemistry, Mathematics.
-JEE Advanced standards: highest difficulty, multi-concept integration, analytical thinking required.
-Difficulty: very hard. Include tricky options, multi-step reasoning, advanced applications.`,
+JEE Advanced standards: highest difficulty, multi-concept integration, analytical thinking required.`,
 
-  'GUJCET': `You are an expert GUJCET (Gujarat Common Entrance Test) MCQ generator.
+  'GUJCET': `You are an expert GUJCET MCQ generator.
 GUJCET standards: Gujarat State Board syllabus, Physics Chemistry Maths/Biology.
-Difficulty: state entrance level. Based on GSEB textbooks, standard applications.`,
+Difficulty: state entrance level. Based on GSEB textbooks.`,
 
-  'Gujarat Board (GHSEB)': `You are an expert GHSEB (Gujarat Higher Secondary Education Board) MCQ generator.
-GHSEB standards: Class 11-12 Gujarat Board syllabus, standard textbook questions.
-Difficulty: board exam level. Focus on textbook definitions, standard formulas, direct applications.`,
+  'Gujarat Board (GHSEB)': `You are an expert GHSEB MCQ generator.
+GHSEB standards: Class 11-12 Gujarat Board syllabus.
+Difficulty: board exam level. Focus on textbook definitions and standard formulas.`,
 
   'General': `You are an expert MCQ generator.
-Create well-balanced questions covering theory, application, and analysis.
-Difficulty: as specified. Make questions educational and clear.`
+Create well-balanced questions covering theory, application, and analysis.`
 };
 
 // ── MAIN GENERATE FUNCTION ────────────────────────────────────
@@ -132,16 +137,15 @@ async function generateQuestions({ topic, numQ, difficulty, language, exam, subj
   const isHin = language === 'Hindi';
 
   const langInstruction = isGuj
-    ? `CRITICAL: Write EVERY word in Gujarati script (ગુજરાતી) ONLY. Questions, options, explanations — all in Gujarati. No English anywhere.`
+    ? `CRITICAL: Write EVERY word in Gujarati script (ગુજરાતી) ONLY. No English anywhere.`
     : isHin
-    ? `CRITICAL: Write EVERY word in Hindi (हिंदी) ONLY. Questions, options, explanations — all in Hindi. No English anywhere.`
-    : `Write everything in clear, standard English.`;
+    ? `CRITICAL: Write EVERY word in Hindi (हिंदी) ONLY. No English anywhere.`
+    : `Write everything in clear English.`;
 
-  // Smaller batches + smaller model to save tokens
+  // Token-efficient settings
   const BATCH = isGuj ? 3 : isHin ? 4 : 10;
   const MAX_TOK = isGuj ? 2500 : isHin ? 3000 : 4000;
-  // 8b-instant has much higher rate limits than 70b — use it always
-  const MODEL = 'llama-3.1-8b-instant';
+  const MODEL = 'llama-3.1-8b-instant'; // High rate limit, fast
 
   const totalBatches = Math.ceil(total / BATCH);
   let allQ = [];
@@ -151,59 +155,54 @@ async function generateQuestions({ topic, numQ, difficulty, language, exam, subj
     const startN = allQ.length + 1;
     let success = false;
 
-    for (let retry = 0; retry < 4 && !success; retry++) {
-      if (retry > 0) await new Promise(r => setTimeout(r, 1200 * retry));
+    for (let retry = 0; retry < 5 && !success; retry++) {
+      if (retry > 0) await new Promise(r => setTimeout(r, 1000 * retry));
 
       const diffMap = {
         'easy': exam === 'JEE Advanced' ? 'medium' : 'easy',
-        'medium': 'medium',
-        'hard': 'hard',
-        'mixed': 'varied (mix of easy, medium, and hard)'
+        'medium': 'medium', 'hard': 'hard',
+        'mixed': 'varied (mix of easy, medium, hard)'
       };
 
       const stemExamples = isGuj
-        ? `કયો, કઈ, શું, ક્યારે, કોણ, કેટલા, નીચેમાંથી કયું, _______ ________., આ પ્રક્રિયામાં, નીચેના વિધાનો પૈકી, સાચો વિકલ્પ, ખોટું વિધાન`
+        ? `કયો, કઈ, શું, ક્યારે, કોણ, કેટલા, નીચેમાંથી, સાચો વિકલ્પ, ખોટું વિધાન`
         : isHin
-        ? `कौन सा, कौन, क्या, कितने, नीचे में से, ______ _______, इस प्रक्रिया में, निम्न में से, सही विकल्प, गलत कथन`
-        : `Which, What, How many, Identify, Which of the following, ______ is/are, The correct statement, Which is NOT, In which, According to NCERT`;
+        ? `कौन सा, क्या, कितने, नीचे में से, सही विकल्प, गलत कथन`
+        : `Which, What, How many, Identify, Which of the following, The correct statement, Which is NOT`;
 
-      const prompt = `Generate exactly ${bCount} MCQ questions about: "${topic}".
-Subject: ${subject || 'General'} | Exam: ${exam} | Difficulty: ${diffMap[difficulty] || difficulty}
+      const prompt = `Generate exactly ${bCount} MCQ about: "${topic}".
+Exam: ${exam} | Subject: ${subject||'General'} | Difficulty: ${diffMap[difficulty]||difficulty}
 ${langInstruction}
-Questions ${startN} to ${startN + bCount - 1}.
-
-VARIETY RULE: Each question MUST start with a DIFFERENT word. Never start with the topic name.
-Use: ${stemExamples}
+Questions ${startN} to ${startN+bCount-1}.
 
 RULES:
-1. Return ONLY a valid JSON array. No markdown, no backticks.
-2. Format: [{"question":"...","options":["A text","B text","C text","D text"],"correct":0,"explanation":"..."}]
-3. "correct" = 0-based index (0=A,1=B,2=C,3=D)
-4. All 4 options distinct and plausible.
-5. Explanation: WHY that answer is correct.
+- Each question starts with a DIFFERENT word. Never repeat topic name at start.
+- Use stems: ${stemExamples}
+- Return ONLY valid JSON array. No markdown, no backticks, no extra text.
+- Format: [{"question":"...","options":["A","B","C","D"],"correct":0,"explanation":"..."}]
+- "correct" = 0-based index (0=A,1=B,2=C,3=D)
+- Keep explanations brief (1-2 lines).
 
 Start with [ and end with ]`;
 
       const result = await callGroq({
         model: MODEL,
         messages: [
-          { role: 'system', content: `${examPrompt}\n${langInstruction}\nReturn ONLY valid JSON array. Nothing before [. Nothing after ].` },
+          { role: 'system', content: `${examPrompt}\n${langInstruction}\nReturn ONLY valid JSON array.` },
           { role: 'user', content: prompt }
         ],
-        temperature: 0.45,
+        temperature: 0.4,
         max_tokens: MAX_TOK
       });
 
-      // Handle errors
       if (!result || result.error) {
         if (result?.error === 'rate_limit') {
           const waitSec = result.waitSec || 60;
           if (onError) onError('rate_limit', waitSec);
-          // Wait for the reset then retry
-          console.log(`All keys rate limited. Waiting ${waitSec}s...`);
-          await new Promise(r => setTimeout(r, Math.min(waitSec * 1000, 30000)));
+          await new Promise(r => setTimeout(r, Math.min(waitSec * 1000, 35000)));
           continue;
-        } else if (result?.error === 'no_keys') {
+        }
+        if (result?.error === 'no_keys') {
           if (onError) onError('no_keys', 0);
           return [];
         }
@@ -219,11 +218,11 @@ Start with [ and end with ]`;
 
       let jsonStr = raw.substring(s, e + 1)
         .replace(/,\s*]/g, ']').replace(/,\s*}/g, '}')
-        .replace(/[\x00-\x1F\x7F]/g, ' ');
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ');
 
       let parsed;
       try { parsed = JSON.parse(jsonStr); } catch { continue; }
-      if (!Array.isArray(parsed)) continue;
+      if (!Array.isArray(parsed) || !parsed.length) continue;
 
       const valid = parsed
         .filter(q => q.question && q.question.length > 5)
@@ -234,23 +233,30 @@ Start with [ and end with ]`;
             ? q.options.slice(0, 4)
             : ['Option A', 'Option B', 'Option C', 'Option D'],
           correct: typeof q.correct === 'number' && q.correct >= 0 && q.correct <= 3 ? q.correct : 0,
-          explanation: q.explanation || 'See textbook for details.',
-          difficulty: difficulty
+          explanation: q.explanation || 'Refer to textbook.',
+          difficulty
         }));
+
+      if (!valid.length) continue;
 
       allQ = [...allQ, ...valid];
       success = true;
-
       if (onProgress) onProgress(allQ.length, total, b + 1, totalBatches);
     }
 
-    if (b < totalBatches - 1) await new Promise(r => setTimeout(r, 400));
+    if (!success && allQ.length > 0) {
+      // Partial success — return what we have
+      if (onProgress) onProgress(allQ.length, allQ.length, totalBatches, totalBatches);
+      break;
+    }
+
+    if (b < totalBatches - 1) await new Promise(r => setTimeout(r, 300));
   }
 
   return allQ;
 }
 
-// ── HTML QUIZ FILE GENERATOR ──────────────────────────────────
+// ── HTML QUIZ BUILDER ─────────────────────────────────────────
 function buildQuizHTML({ title, exam, subject, topic, difficulty, language, questions }) {
   const diffLabel = { easy: 'Easy', medium: 'Medium', hard: 'Hard', mixed: 'Mixed' }[difficulty] || difficulty;
   const questionsJSON = JSON.stringify(questions);
@@ -263,7 +269,7 @@ function buildQuizHTML({ title, exam, subject, topic, difficulty, language, ques
 <title>${title}</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0a0a0f;--surface:#13131a;--card:#1a1a24;--border:#2a2a3a;--accent:#7c6aff;--accent2:#ff6a9b;--accent3:#6affd4;--text:#e8e8f0;--muted:#7070a0;--gold:#ffd166;}
+:root{--bg:#0a0a0f;--surface:#13131a;--card:#1a1a24;--border:#2a2a3a;--accent:#7c6aff;--accent2:#ff6a9b;--accent3:#6affd4;--text:#e8e8f0;--muted:#7070a0;}
 *{margin:0;padding:0;box-sizing:border-box;}
 body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:20px;}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellipse at 20% 20%,rgba(124,106,255,.08),transparent 50%),radial-gradient(ellipse at 80% 80%,rgba(255,106,155,.06),transparent 50%);pointer-events:none;}
@@ -347,64 +353,53 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellips
     <div class="fin-msg" id="finMsg"></div>
   </div>
   <div id="questionsWrap"></div>
-  <div class="branding">Generated by <strong>NEXUS HUB XD</strong> · ${exam} · ${new Date().toLocaleDateString('en-IN')} · nexushubxd.vercel.app</div>
+  <div class="branding">Generated by <strong>NEXUS HUB XD</strong> · ${exam} · ${new Date().toLocaleDateString('en-IN')}</div>
 </div>
 <script>
-const QUESTIONS = ${questionsJSON};
-let answered = {}, score = 0;
-function renderAll() {
-  const wrap = document.getElementById('questionsWrap');
-  wrap.innerHTML = QUESTIONS.map((q, i) => \`
-    <div class="q-card" id="qc\${i}">
-      <div class="q-top"><div class="q-num">\${i+1}</div><div class="q-text">\${q.question}</div></div>
-      <div class="opts">\${q.options.map((o, oi) => \`
-        <div class="opt" id="opt_\${i}_\${oi}" onclick="pick(\${i},\${oi})">
-          <div class="opt-ltr">\${'ABCD'[oi]}</div><span>\${o}</span>
-        </div>\`).join('')}</div>
-      <div class="exp" id="exp\${i}">\${q.explanation}</div>
-    </div>\`).join('');
+const QUESTIONS=${questionsJSON};
+let answered={},score=0;
+function renderAll(){
+  const w=document.getElementById('questionsWrap');
+  w.innerHTML=QUESTIONS.map((q,i)=>\`<div class="q-card" id="qc\${i}">
+    <div class="q-top"><div class="q-num">\${i+1}</div><div class="q-text">\${q.question}</div></div>
+    <div class="opts">\${q.options.map((o,oi)=>\`<div class="opt" id="opt_\${i}_\${oi}" onclick="pick(\${i},\${oi})"><div class="opt-ltr">\${'ABCD'[oi]}</div><span>\${o}</span></div>\`).join('')}</div>
+    <div class="exp" id="exp\${i}">\${q.explanation}</div>
+  </div>\`).join('');
 }
-function pick(qi, sel) {
-  if (answered[qi] !== undefined) return;
-  answered[qi] = sel;
-  const correct = QUESTIONS[qi].correct;
-  const cEl = document.getElementById('opt_'+qi+'_'+correct);
-  const sEl = document.getElementById('opt_'+qi+'_'+sel);
-  if (cEl) cEl.classList.add('correct');
-  if (sel !== correct && sEl) sEl.classList.add('wrong');
-  document.querySelectorAll('#qc'+qi+' .opt').forEach(el => el.classList.add('locked'));
-  const exp = document.getElementById('exp'+qi);
-  if (exp) exp.classList.add('show');
-  if (sel === correct) score++;
+function pick(qi,sel){
+  if(answered[qi]!==undefined)return;
+  answered[qi]=sel;
+  const c=QUESTIONS[qi].correct;
+  document.getElementById('opt_'+qi+'_'+c)?.classList.add('correct');
+  if(sel!==c)document.getElementById('opt_'+qi+'_'+sel)?.classList.add('wrong');
+  document.querySelectorAll('#qc'+qi+' .opt').forEach(el=>el.classList.add('locked'));
+  document.getElementById('exp'+qi)?.classList.add('show');
+  if(sel===c)score++;
   updateScore();
 }
-function updateScore() {
-  const done = Object.keys(answered).length;
-  const total = QUESTIONS.length;
-  const pct = done ? Math.round(score/done*100) : 0;
-  document.getElementById('scoreNum').textContent = score+'/'+done;
-  document.getElementById('scorePct').textContent = pct+'% · '+done+'/'+total+' answered';
-  document.getElementById('pFill').style.width = (done/total*100)+'%';
-  const fs = document.getElementById('finScore');
-  const fl = document.getElementById('finLabel');
-  const fm = document.getElementById('finMsg');
-  if (fs) { fs.textContent = score+'/'+done; fl.textContent = pct+'% score · '+done+'/'+total+' answered'; }
-  if (done === total) { fm.textContent = pct>=80?'🏆 Excellent!':pct>=60?'👍 Good Job!':pct>=40?'📚 Keep Studying!':'💪 Try Again!'; }
+function updateScore(){
+  const done=Object.keys(answered).length,total=QUESTIONS.length;
+  const pct=done?Math.round(score/done*100):0;
+  document.getElementById('scoreNum').textContent=score+'/'+done;
+  document.getElementById('scorePct').textContent=pct+'% · '+done+'/'+total+' answered';
+  document.getElementById('pFill').style.width=(done/total*100)+'%';
+  document.getElementById('finScore').textContent=score+'/'+done;
+  document.getElementById('finLabel').textContent=pct+'% score · '+done+'/'+total+' answered';
+  if(done===total)document.getElementById('finMsg').textContent=pct>=80?'🏆 Excellent!':pct>=60?'👍 Good Job!':pct>=40?'📚 Keep Studying!':'💪 Try Again!';
 }
-function revealAll() {
-  QUESTIONS.forEach((q,i) => {
-    if (answered[i] === undefined) {
-      answered[i] = q.correct;
-      const cEl = document.getElementById('opt_'+i+'_'+q.correct);
-      if (cEl) cEl.classList.add('correct');
-      document.querySelectorAll('#qc'+i+' .opt').forEach(el => el.classList.add('locked'));
-      const exp = document.getElementById('exp'+i); if (exp) exp.classList.add('show');
+function revealAll(){
+  QUESTIONS.forEach((q,i)=>{
+    if(answered[i]===undefined){
+      answered[i]=q.correct;
+      document.getElementById('opt_'+i+'_'+q.correct)?.classList.add('correct');
+      document.querySelectorAll('#qc'+i+' .opt').forEach(el=>el.classList.add('locked'));
+      document.getElementById('exp'+i)?.classList.add('show');
     }
   });
-  score = 0; QUESTIONS.forEach((q,i) => { if(answered[i]===q.correct) score++; });
-  updateScore(); document.getElementById('finCard').classList.add('show');
+  score=0;QUESTIONS.forEach((q,i)=>{if(answered[i]===q.correct)score++;});
+  updateScore();document.getElementById('finCard').classList.add('show');
 }
-function resetQuiz() { answered = {}; score = 0; document.getElementById('finCard').classList.remove('show'); renderAll(); updateScore(); }
+function resetQuiz(){answered={};score=0;document.getElementById('finCard').classList.remove('show');renderAll();updateScore();}
 renderAll();
 </script>
 </body>
