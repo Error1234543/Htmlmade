@@ -137,15 +137,16 @@ async function generateQuestions({ topic, numQ, difficulty, language, exam, subj
   const isHin = language === 'Hindi';
 
   const langInstruction = isGuj
-    ? `CRITICAL: Write EVERY word in Gujarati script (ગુજરાતી) ONLY. No English anywhere.`
+    ? `IMPORTANT: Write in Gujarati script (ગુજરાતી). Keep scientific names, Latin terms, chemical formulas in original English/Latin (e.g. Homo sapiens, DNA, H2O). Never transliterate scientific terms. All question text and options must be proper Gujarati.`
     : isHin
-    ? `CRITICAL: Write EVERY word in Hindi (हिंदी) ONLY. No English anywhere.`
+    ? `IMPORTANT: Write in Hindi (हिंदी). Keep scientific names, Latin terms, chemical formulas in original English/Latin. All question text must be proper Hindi.`
     : `Write everything in clear English.`;
 
   // Token-efficient settings
   const BATCH = isGuj ? 3 : isHin ? 4 : 10;
   const MAX_TOK = isGuj ? 2500 : isHin ? 3000 : 4000;
-  const MODEL = 'llama-3.1-8b-instant'; // High rate limit, fast
+  // 70b for Gujarati/Hindi (better script quality), 8b for English (fast)
+  const MODEL = isGuj ? 'llama-3.3-70b-versatile' : isHin ? 'llama-3.3-70b-versatile' : 'llama-3.1-8b-instant';
 
   const totalBatches = Math.ceil(total / BATCH);
   let allQ = [];
@@ -413,3 +414,4 @@ renderAll();
 }
 
 window.NEXUS = { generateQuestions, buildQuizHTML, GROQ_KEYS };
+ 
