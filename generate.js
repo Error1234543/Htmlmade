@@ -20,9 +20,9 @@ function isKeyAvailable(idx) {
 }
 
 function markRateLimited(idx, retryAfterSec) {
-  const wait = Math.max((retryAfterSec || 60), 30) * 1000;
+  const wait = (retryAfterSec || 10) * 1000;
   keyStatus[idx] = { limited: true, resetAt: Date.now() + wait };
-  console.warn(`Key ${idx+1} rate limited for ${retryAfterSec || 60}s`);
+  console.warn(`Key ${idx+1} rate limited for ${retryAfterSec || 10}s`);
 }
 
 // Returns how many seconds until a key is free (0 if free now)
@@ -150,27 +150,27 @@ async function generateQuestions({ topic, numQ, difficulty, language, exam, subj
   const totalBatches = Math.ceil(total / BATCH);
   let allQ = [];
 
-  for (let b = 0; b < totalBatches; b++) {
-    const bCount = Math.min(BATCH, total - allQ.length);
-    const startN = allQ.length + 1;
-    let success = false;
+  // Run 2 batches in parallel (faster!) except for Gujarati (token heavy)
+  const PARALLEL = isGuj ? 1 : 2;
 
-    for (let retry = 0; retry < 5 && !success; retry++) {
-      if (retry > 0) await new Promise(r => setTimeout(r, 1000 * retry));
+  async function fetchBatch(batchIndex, startId) {
+    const bCount = Math.min(BATCH, total - startId);
+    if (bCount <= 0) return [];
+    const startN = startId + 1;
 
-      const diffMap = {
-        'easy': exam === 'JEE Advanced' ? 'medium' : 'easy',
-        'medium': 'medium', 'hard': 'hard',
-        'mixed': 'varied (mix of easy, medium, hard)'
-      };
+    const diffMap = {
+      'easy': exam === 'JEE Advanced' ? 'medium' : 'easy',
+      'medium': 'medium', 'hard': 'hard',
+      'mixed': 'varied (mix of easy, medium, hard)'
+    };
 
-      const stemExamples = isGuj
-        ? `કયો, કઈ, શું, ક્યારે, કોણ, કેટલા, નીચેમાંથી, સાચો વિકલ્પ, ખોટું વિધાન`
-        : isHin
-        ? `कौन सा, क्या, कितने, नीचे में से, सही विकल्प, गलत कथन`
-        : `Which, What, How many, Identify, Which of the following, The correct statement, Which is NOT`;
+    const stemExamples = isGuj
+      ? `કયો, કઈ, શું, ક્યારે, કોણ, કેટલા, નીચેમાંથી, સાચો વિકલ્પ, ખોટું વિધાન`
+      : isHin
+      ? `कौन सा, क्या, कितने, नीचे में से, सही विकल्प, गलत कथन`
+      : `Which, What, How many, Identify, Which of the following, The correct statement, Which is NOT`;
 
-      const prompt = `Generate exactly ${bCount} MCQ about: "${topic}".
+    const prompt = `Generate exactly ${bCount} MCQ about: "${topic}".
 Exam: ${exam} | Subject: ${subject||'General'} | Difficulty: ${diffMap[difficulty]||difficulty}
 ${langInstruction}
 Questions ${startN} to ${startN+bCount-1}.
@@ -185,6 +185,7 @@ RULES:
 
 Start with [ and end with ]`;
 
+    for (let retry = 0; retry < 3; retry++) {
       const result = await callGroq({
         model: MODEL,
         messages: [
@@ -197,10 +198,9 @@ Start with [ and end with ]`;
 
       if (!result || result.error) {
         if (result?.error === 'rate_limit') {
-          const waitSec = result.waitSec || 60;
+          const waitSec = result.waitSec || 10;
           if (onError) onError('rate_limit', waitSec);
-          await new Promise(r => setTimeout(r, Math.min(waitSec * 1000, 35000)));
-          continue;
+          await new Promise(r => setTimeout(r, waitSec * 1000));
         }
         if (result?.error === 'no_keys') {
           if (onError) onError('no_keys', 0);
@@ -224,10 +224,10 @@ Start with [ and end with ]`;
       try { parsed = JSON.parse(jsonStr); } catch { continue; }
       if (!Array.isArray(parsed) || !parsed.length) continue;
 
-      const valid = parsed
+      return parsed
         .filter(q => q.question && q.question.length > 5)
         .map((q, i) => ({
-          id: allQ.length + i + 1,
+          id: startId + i + 1,
           question: q.question,
           options: Array.isArray(q.options) && q.options.length >= 4
             ? q.options.slice(0, 4)
@@ -236,21 +236,27 @@ Start with [ and end with ]`;
           explanation: q.explanation || 'Refer to textbook.',
           difficulty
         }));
+    }
+    return [];
+  }
 
-      if (!valid.length) continue;
-
-      allQ = [...allQ, ...valid];
-      success = true;
-      if (onProgress) onProgress(allQ.length, total, b + 1, totalBatches);
+  // Process batches — parallel where possible
+  for (let b = 0; b < totalBatches; b += PARALLEL) {
+    const batchPromises = [];
+    for (let p = 0; p < PARALLEL && (b + p) < totalBatches; p++) {
+      const startId = (b + p) * BATCH;
+      batchPromises.push(fetchBatch(b + p, Math.min(startId, total - 1)));
     }
 
-    if (!success && allQ.length > 0) {
-      // Partial success — return what we have
-      if (onProgress) onProgress(allQ.length, allQ.length, totalBatches, totalBatches);
-      break;
+    const results = await Promise.all(batchPromises);
+    for (const res of results) {
+      if (res.length > 0) {
+        // Fix IDs to be sequential
+        res.forEach((q, i) => { q.id = allQ.length + i + 1; });
+        allQ = [...allQ, ...res];
+        if (onProgress) onProgress(allQ.length, total, Math.ceil(allQ.length / BATCH), totalBatches);
+      }
     }
-
-    if (b < totalBatches - 1) await new Promise(r => setTimeout(r, 300));
   }
 
   return allQ;
